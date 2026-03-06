@@ -16,6 +16,7 @@ STATE_FILE="${STATE_FILE:-${HOME}/.local/komodo/periphery-updater.last_tag}"
 PERIPHERY_BIN_PATH="${PERIPHERY_BIN_PATH:-/usr/local/bin/periphery}"
 PERIPHERY_SERVICE="${PERIPHERY_SERVICE:-periphery}"
 REMOTE_SUDO="${REMOTE_SUDO:-sudo}"
+REMOTE_SUDO_PASSWORD="${REMOTE_SUDO_PASSWORD:-}"
 
 ##############################################################################
 # Check for required commands and auto-install if missing
@@ -172,6 +173,25 @@ for host in $PERIPHERY_HOSTS; do
     echo "---- Host: $ssh_host ----"
   fi
 
+  # Check if user is root or has passwordless sudo
+  remote_user_check="$(ssh $ssh_opts "$ssh_host" 'id -u' 2>/dev/null || true)"
+  is_root=0
+  if [[ "$remote_user_check" == "0" ]]; then
+    is_root=1
+  fi
+  
+  # If not root, check if sudo works without password or if password is provided
+  if [[ $is_root -eq 0 ]]; then
+    if [[ -z "$REMOTE_SUDO_PASSWORD" ]]; then
+      # No password provided, require passwordless sudo
+      if ! (ssh $ssh_opts "$ssh_host" 'sudo -n true' 2>/dev/null); then
+        echo "sudo requires password and REMOTE_SUDO_PASSWORD not set; skipping"
+        all_ok=0
+        continue
+      fi
+    fi
+  fi
+
   remote_arch="$(ssh $ssh_opts "$ssh_host" 'uname -m' 2>/dev/null || true)"
 
   if [[ -z "$remote_arch" ]]; then
@@ -193,7 +213,7 @@ for host in $PERIPHERY_HOSTS; do
   echo "Arch: $remote_arch; checking version..."
 
   # Check current version on remote host
-  remote_version="$(ssh $ssh_opts "$ssh_host" "$PERIPHERY_BIN_PATH --version 2>/dev/null || true" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -1 || echo "unknown")"
+  remote_version="$(ssh $ssh_opts "$ssh_host" "$PERIPHERY_BIN_PATH --version 2>/dev/null || true" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?' | head -1 || echo "unknown")"
   
   # Normalize versions by removing 'v' prefix for comparison
   remote_version_normalized="${remote_version#v}"
@@ -211,6 +231,8 @@ for host in $PERIPHERY_HOSTS; do
       BIN="$PERIPHERY_BIN_PATH" \
       SERVICE="$PERIPHERY_SERVICE" \
       SUDO_CMD="$REMOTE_SUDO" \
+      SUDO_PASSWORD="$REMOTE_SUDO_PASSWORD" \
+      IS_ROOT="$is_root" \
       'bash -s' <<'EOF'
 set -euo pipefail
 tmp="$(mktemp)"
@@ -219,14 +241,20 @@ trap 'rm -f "$tmp"' EXIT
 curl -fL --retry 3 --connect-timeout 15 "$URL" -o "$tmp"
 chmod +x "$tmp"
 
-if [[ -n "${SUDO_CMD:-}" ]]; then
-  $SUDO_CMD install -m 0755 "$tmp" "$BIN"
-  $SUDO_CMD systemctl restart "$SERVICE"
-  $SUDO_CMD systemctl is-active --quiet "$SERVICE"
-else
+if [[ "$IS_ROOT" == "1" ]]; then
   install -m 0755 "$tmp" "$BIN"
   systemctl restart "$SERVICE"
   systemctl is-active --quiet "$SERVICE"
+else
+  if [[ -n "${SUDO_PASSWORD:-}" ]]; then
+    echo "$SUDO_PASSWORD" | $SUDO_CMD -S install -m 0755 "$tmp" "$BIN"
+    echo "$SUDO_PASSWORD" | $SUDO_CMD -S systemctl restart "$SERVICE"
+    echo "$SUDO_PASSWORD" | $SUDO_CMD -S systemctl is-active --quiet "$SERVICE"
+  else
+    $SUDO_CMD install -m 0755 "$tmp" "$BIN"
+    $SUDO_CMD systemctl restart "$SERVICE"
+    $SUDO_CMD systemctl is-active --quiet "$SERVICE"
+  fi
 fi
 EOF
   then

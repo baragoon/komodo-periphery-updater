@@ -193,9 +193,13 @@ for host in $PERIPHERY_HOSTS; do
   echo "Arch: $remote_arch; checking version..."
 
   # Check current version on remote host
-  remote_version="$(ssh $ssh_opts "$ssh_host" "$PERIPHERY_BIN_PATH --version 2>/dev/null || true" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")"
+  remote_version="$(ssh $ssh_opts "$ssh_host" "$PERIPHERY_BIN_PATH --version 2>/dev/null || true" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -1 || echo "unknown")"
   
-  if [[ "$remote_version" == "$latest_tag" || "$remote_version" == "${latest_tag#v}" ]]; then
+  # Normalize versions by removing 'v' prefix for comparison
+  remote_version_normalized="${remote_version#v}"
+  latest_tag_normalized="${latest_tag#v}"
+  
+  if [[ "$remote_version_normalized" == "$latest_tag_normalized" ]]; then
     echo "Already up-to-date ($remote_version), skipping."
     continue
   fi

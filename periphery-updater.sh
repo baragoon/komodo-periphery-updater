@@ -16,7 +16,6 @@ STATE_FILE="${STATE_FILE:-${HOME}/.local/komodo/periphery-updater.last_tag}"
 PERIPHERY_BIN_PATH="${PERIPHERY_BIN_PATH:-/usr/local/bin/periphery}"
 PERIPHERY_SERVICE="${PERIPHERY_SERVICE:-periphery}"
 REMOTE_SUDO="${REMOTE_SUDO:-sudo}"
-REMOTE_SUDO_PASSWORD="${REMOTE_SUDO_PASSWORD:-}"
 
 ##############################################################################
 # Check for required commands and auto-install if missing
@@ -157,20 +156,54 @@ all_ok=1
 updated=0
 
 for host in $PERIPHERY_HOSTS; do
-  # Parse host and optional port (format: user@host:port)
+  # Parse host entry: user@host[:port[:password]]
   ssh_host="$host"
   ssh_port=""
+  ssh_password=""  # No default password
+  
+  # Split by colon to extract port and password
   if [[ "$host" == *:* ]]; then
-    ssh_host="${host%:*}"
-    ssh_port="${host##*:}"
+    ssh_host="${host%%:*}"
+    remainder="${host#*:}"
+    
+    # Check if there's a second colon (password separator)
+    if [[ "$remainder" == *:* ]]; then
+      # Format: user@host:port:password or user@host::password
+      first_part="${remainder%%:*}"
+      ssh_password="${remainder#*:}"
+      
+      # If first part is numeric, it's a port
+      if [[ "$first_part" =~ ^[0-9]+$ ]]; then
+        ssh_port="$first_part"
+      else
+        # first_part is actually a password (no port specified)
+        ssh_password="$first_part"
+      fi
+    else
+      # Format: user@host:port or user@host:password
+      # Determine if it's port or password
+      if [[ "$remainder" =~ ^[0-9]+$ ]]; then
+        ssh_port="$remainder"
+      else
+        ssh_password="$remainder"
+      fi
+    fi
   fi
   
   ssh_opts="-o BatchMode=yes -o ConnectTimeout=10"
   if [[ -n "$ssh_port" ]]; then
     ssh_opts="$ssh_opts -p $ssh_port"
-    echo "---- Host: $ssh_host (port $ssh_port) ----"
+    if [[ -n "$ssh_password" ]]; then
+      echo "---- Host: $ssh_host (port $ssh_port, with password) ----"
+    else
+      echo "---- Host: $ssh_host (port $ssh_port) ----"
+    fi
   else
-    echo "---- Host: $ssh_host ----"
+    if [[ -n "$ssh_password" ]]; then
+      echo "---- Host: $ssh_host (with password) ----"
+    else
+      echo "---- Host: $ssh_host ----"
+    fi
   fi
 
   # Check if user is root or has passwordless sudo
@@ -182,10 +215,10 @@ for host in $PERIPHERY_HOSTS; do
   
   # If not root, check if sudo works without password or if password is provided
   if [[ $is_root -eq 0 ]]; then
-    if [[ -z "$REMOTE_SUDO_PASSWORD" ]]; then
+    if [[ -z "$ssh_password" ]]; then
       # No password provided, require passwordless sudo
       if ! (ssh $ssh_opts "$ssh_host" 'sudo -n true' 2>/dev/null); then
-        echo "sudo requires password and REMOTE_SUDO_PASSWORD not set; skipping"
+        echo "sudo requires password; provide it in PERIPHERY_HOSTS as user@host:password or user@host:port:password"
         all_ok=0
         continue
       fi
@@ -231,7 +264,7 @@ for host in $PERIPHERY_HOSTS; do
       BIN="$PERIPHERY_BIN_PATH" \
       SERVICE="$PERIPHERY_SERVICE" \
       SUDO_CMD="$REMOTE_SUDO" \
-      SUDO_PASSWORD="$REMOTE_SUDO_PASSWORD" \
+      SUDO_PASSWORD="$ssh_password" \
       IS_ROOT="$is_root" \
       'bash -s' <<'EOF'
 set -euo pipefail

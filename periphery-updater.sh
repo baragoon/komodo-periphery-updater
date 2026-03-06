@@ -136,12 +136,7 @@ if [[ -f "$STATE_FILE" ]]; then
   last_tag="$(cat "$STATE_FILE" || true)"
 fi
 
-if [[ "$latest_tag" == "$last_tag" ]]; then
-  echo "No new tag. Current: $latest_tag"
-  exit 0
-fi
-
-echo "New tag detected: $latest_tag (previous: ${last_tag:-none})"
+echo "Latest tag: $latest_tag (previously: ${last_tag:-none})"
 
 release_json="$(api_get "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/tags/${latest_tag}")"
 

@@ -32,6 +32,18 @@ export PERIPHERY_HOSTS="user@host1:22 user@host2:2222"
 ./periphery-updater.sh
 ```
 
+### With sudo Password
+
+If remote users require sudo password (not recommended for automation):
+
+```bash
+export PERIPHERY_HOSTS="user@host1 user@host2"
+export REMOTE_SUDO_PASSWORD="password_here"
+./periphery-updater.sh
+```
+
+The script uses `sudo -S` to read the password from stdin for each sudo command.
+
 ### With GitHub Token (Recommended)
 
 Avoid API rate limits:
@@ -60,6 +72,7 @@ All settings can be overridden via environment variables:
 | `PERIPHERY_BIN_PATH` | `/usr/local/bin/periphery` | Remote binary install path |
 | `PERIPHERY_SERVICE` | `periphery` | Remote systemd service name |
 | `REMOTE_SUDO` | `sudo` | Command for privilege escalation (set `""` if root) |
+| `REMOTE_SUDO_PASSWORD` | *(optional)* | Password for sudo (if required; uses `sudo -S`) |
 
 ## Requirements
 
@@ -95,6 +108,41 @@ ssh-copy-id -p 2222 user@host2  # with custom port
 ssh -o BatchMode=yes user@host1 echo ok
 ssh -o BatchMode=yes -p 2222 user@host2 echo ok  # with custom port
 ```
+
+## Sudo Configuration
+
+For non-root users, you have two options:
+
+### Option 1: Passwordless Sudo (Recommended for Automation)
+
+Configure on remote hosts:
+
+```bash
+# Unrestricted
+sudo echo "username ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/periphery-updater
+
+# Or more restrictive (recommended)
+echo "username ALL=(ALL) NOPASSWD: /usr/bin/install, /bin/systemctl" | sudo tee /etc/sudoers.d/periphery-updater
+```
+
+Then run without `REMOTE_SUDO_PASSWORD`:
+
+```bash
+export PERIPHERY_HOSTS="user@host1 user@host2"
+./periphery-updater.sh
+```
+
+### Option 2: Sudo with Password
+
+If passwordless sudo is not an option, provide the password:
+
+```bash
+export PERIPHERY_HOSTS="user@host1 user@host2"
+export REMOTE_SUDO_PASSWORD="your_password"
+./periphery-updater.sh
+```
+
+> Note: Passing passwords via environment variables is less secure. Prefer passwordless sudo for automation.
 
 ## Example: Automated Schedule
 

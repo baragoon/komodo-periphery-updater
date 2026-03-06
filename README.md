@@ -32,17 +32,19 @@ export PERIPHERY_HOSTS="user@host1:22 user@host2:2222"
 ./periphery-updater.sh
 ```
 
-### With sudo Password
+### With Per-Host Sudo Passwords
 
-If remote users require sudo password (not recommended for automation):
+Specify passwords per host in the format `user@host:port:password`:
 
 ```bash
-export PERIPHERY_HOSTS="user@host1 user@host2"
-export REMOTE_SUDO_PASSWORD="password_here"
+export PERIPHERY_HOSTS="user@host1:2222:pass1 user@host2::pass2 user@host3:22 root@host4"
 ./periphery-updater.sh
 ```
 
-The script uses `sudo -S` to read the password from stdin for each sudo command.
+- `user@host1:2222:pass1` - port 2222, password "pass1"
+- `user@host2::pass2` - default SSH port, password "pass2"
+- `user@host3:22` - port 22, passwordless sudo (must be configured)
+- `root@host4` - root user, no sudo needed
 
 ### With GitHub Token (Recommended)
 
@@ -64,7 +66,7 @@ All settings can be overridden via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PERIPHERY_HOSTS` | *(required)* | Space-separated SSH targets: `"user@host1 user@host2:2222"` (ports optional) |
+| `PERIPHERY_HOSTS` | *(required)* | Space-separated SSH targets: `"user@host1 user@host2:2222 user@host3:2222:password"` (ports and passwords optional) |
 | `GITHUB_TOKEN` | *(optional)* | GitHub personal access token (recommended) |
 | `GITHUB_OWNER` | `moghtech` | GitHub repository owner |
 | `GITHUB_REPO` | `komodo` | GitHub repository name |
@@ -72,7 +74,6 @@ All settings can be overridden via environment variables:
 | `PERIPHERY_BIN_PATH` | `/usr/local/bin/periphery` | Remote binary install path |
 | `PERIPHERY_SERVICE` | `periphery` | Remote systemd service name |
 | `REMOTE_SUDO` | `sudo` | Command for privilege escalation (set `""` if root) |
-| `REMOTE_SUDO_PASSWORD` | *(optional)* | Password for sudo (if required; uses `sudo -S`) |
 
 ## Requirements
 
@@ -134,11 +135,10 @@ export PERIPHERY_HOSTS="user@host1 user@host2"
 
 ### Option 2: Sudo with Password
 
-If passwordless sudo is not an option, provide the password:
+If passwordless sudo is not an option, provide the password in `PERIPHERY_HOSTS`:
 
 ```bash
-export PERIPHERY_HOSTS="user@host1 user@host2"
-export REMOTE_SUDO_PASSWORD="your_password"
+export PERIPHERY_HOSTS="user@host1:password user@host2:2222:mypass"
 ./periphery-updater.sh
 ```
 

@@ -161,9 +161,23 @@ all_ok=1
 updated=0
 
 for host in $PERIPHERY_HOSTS; do
-  echo "---- Host: $host ----"
+  # Parse host and optional port (format: user@host:port)
+  ssh_host="$host"
+  ssh_port=""
+  if [[ "$host" == *:* ]]; then
+    ssh_host="${host%:*}"
+    ssh_port="${host##*:}"
+  fi
+  
+  ssh_opts="-o BatchMode=yes -o ConnectTimeout=10"
+  if [[ -n "$ssh_port" ]]; then
+    ssh_opts="$ssh_opts -p $ssh_port"
+    echo "---- Host: $ssh_host (port $ssh_port) ----"
+  else
+    echo "---- Host: $ssh_host ----"
+  fi
 
-  remote_arch="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" 'uname -m' 2>/dev/null || true)"
+  remote_arch="$(ssh $ssh_opts "$ssh_host" 'uname -m' 2>/dev/null || true)"
 
   if [[ -z "$remote_arch" ]]; then
     echo "Could not probe host $host"
@@ -184,7 +198,7 @@ for host in $PERIPHERY_HOSTS; do
   echo "Arch: $remote_arch; checking version..."
 
   # Check current version on remote host
-  remote_version="$(ssh -o BatchMode=yes "$host" "$PERIPHERY_BIN_PATH --version 2>/dev/null || true" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")"
+  remote_version="$(ssh $ssh_opts "$ssh_host" "$PERIPHERY_BIN_PATH --version 2>/dev/null || true" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")"
   
   if [[ "$remote_version" == "$latest_tag" || "$remote_version" == "${latest_tag#v}" ]]; then
     echo "Already up-to-date ($remote_version), skipping."
@@ -193,7 +207,7 @@ for host in $PERIPHERY_HOSTS; do
   
   echo "Version mismatch: remote=$remote_version, latest=$latest_tag; updating..."
 
-  if ssh -o BatchMode=yes "$host" \
+  if ssh $ssh_opts "$ssh_host" \
       URL="$asset_url" \
       BIN="$PERIPHERY_BIN_PATH" \
       SERVICE="$PERIPHERY_SERVICE" \
@@ -217,10 +231,10 @@ else
 fi
 EOF
   then
-    echo "✓ Updated on $host"
+    echo "✓ Updated on $ssh_host"
     updated=$((updated + 1))
   else
-    echo "✗ Update failed on $host"
+    echo "✗ Update failed on $ssh_host"
     all_ok=0
   fi
 done

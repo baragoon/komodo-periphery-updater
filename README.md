@@ -23,6 +23,15 @@ export PERIPHERY_HOSTS="user@host1 user@host2"
 ./periphery-updater.sh
 ```
 
+### With Custom SSH Ports
+
+Specify ports using `user@host:port` format:
+
+```bash
+export PERIPHERY_HOSTS="user@host1:22 user@host2:2222"
+./periphery-updater.sh
+```
+
 ### With GitHub Token (Recommended)
 
 Avoid API rate limits:
@@ -43,7 +52,7 @@ All settings can be overridden via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PERIPHERY_HOSTS` | *(required)* | Space-separated SSH targets: `"user@host1 user@host2"` |
+| `PERIPHERY_HOSTS` | *(required)* | Space-separated SSH targets: `"user@host1 user@host2:2222"` (ports optional) |
 | `GITHUB_TOKEN` | *(optional)* | GitHub personal access token (recommended) |
 | `GITHUB_OWNER` | `moghtech` | GitHub repository owner |
 | `GITHUB_REPO` | `komodo` | GitHub repository name |
@@ -80,10 +89,11 @@ ssh-keygen -t ed25519 -C "komodo-updater"
 
 # Copy to remote hosts
 ssh-copy-id user@host1
-ssh-copy-id user@host2
+ssh-copy-id -p 2222 user@host2  # with custom port
 
 # Test
 ssh -o BatchMode=yes user@host1 echo ok
+ssh -o BatchMode=yes -p 2222 user@host2 echo ok  # with custom port
 ```
 
 ## Example: Automated Schedule
@@ -97,7 +107,7 @@ crontab -e
 Add:
 
 ```
-0 */6 * * * PERIPHERY_HOSTS="user@host1 user@host2" GITHUB_TOKEN="ghp_..." /path/to/periphery-updater.sh >> /var/log/periphery-updater.log 2>&1
+0 */6 * * * PERIPHERY_HOSTS="user@host1 user@host2:2222" GITHUB_TOKEN="ghp_..." /path/to/periphery-updater.sh >> /var/log/periphery-updater.log 2>&1
 ```
 
 ### Systemd Timer
@@ -110,7 +120,7 @@ Description=Komodo Periphery Updater
 
 [Service]
 Type=oneshot
-Environment="PERIPHERY_HOSTS=user@host1 user@host2"
+Environment="PERIPHERY_HOSTS=user@host1 user@host2:2222"
 Environment="GITHUB_TOKEN=ghp_..."
 ExecStart=/usr/local/bin/periphery-updater.sh
 StandardOutput=journal
@@ -167,6 +177,9 @@ rm ~/.local/komodo/periphery-updater.last_tag
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=10 user@host1 'uname -m'
+
+# With custom port
+ssh -o BatchMode=yes -o ConnectTimeout=10 -p 2222 user@host1 'uname -m'
 ```
 
 ### View remote periphery version

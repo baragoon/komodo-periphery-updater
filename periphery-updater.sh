@@ -193,6 +193,22 @@ deferred_hosts=()
 local_boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
 
 ##############################################################################
+# remote_priv <ssh_opts> <ssh_host> <is_root> <password> <command string>
+# Runs a command on the remote host with privileges: directly if root,
+# otherwise via sudo (password sent on stdin, never on the command line).
+##############################################################################
+remote_priv() {
+  local opts="$1" target="$2" root="$3" pw="$4" cmd="$5"
+  if [[ "$root" == "1" ]]; then
+    ssh $opts "$target" "$cmd"
+  elif [[ -n "$pw" ]]; then
+    printf '%s\n' "$pw" | ssh $opts "$target" "$REMOTE_SUDO -S -p '' $cmd"
+  else
+    ssh $opts "$target" "$REMOTE_SUDO -n $cmd"
+  fi
+}
+
+##############################################################################
 # process_host <host-entry> <pass>
 #   pass 1: normal hosts; the host we are running on is deferred
 #   pass 2: deferred (local) host, detached delayed restart
@@ -304,21 +320,43 @@ process_host() {
   local remote_version
   remote_version="$(ssh $ssh_opts "$ssh_host" "$PERIPHERY_BIN_PATH --version 2>/dev/null || true" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?' | head -1 || echo "unknown")"
 
-  # Compare the installed binary's sha256 with the release asset (reliable).
-  # Fall back to the --version string only if no hash is available.
-  local remote_sha=""
+  # 1) Is the installed binary the release binary? Compare sha256 (reliable);
+  #    fall back to the --version string only if no hash is available.
+  local binary_ok=0 remote_sha=""
   if [[ -n "$expected_sha" ]]; then
     remote_sha="$(ssh $ssh_opts "$ssh_host" "sha256sum '$PERIPHERY_BIN_PATH' 2>/dev/null || shasum -a 256 '$PERIPHERY_BIN_PATH' 2>/dev/null" | awk '{print $1}' || true)"
-    if [[ "$remote_sha" == "$expected_sha" ]]; then
-      echo "Already up-to-date (sha256 matches release $latest_tag), skipping."
-      return 0
-    fi
+    [[ "$remote_sha" == "$expected_sha" ]] && binary_ok=1
   elif [[ "${remote_version#v}" == "${latest_tag#v}" ]]; then
-    echo "Already up-to-date ($remote_version), skipping."
-    return 0
+    binary_ok=1
   fi
 
-  echo "Binary differs from release $latest_tag (reported version: ${remote_version:-unknown}); updating..."
+  # 2) Which version is the service actually running? Read the startup log
+  #    line ("Komodo Periphery version: vX.Y.Z") with sudo for non-root users;
+  #    falls back to journalctl.
+  local running_version
+  running_version="$(remote_priv "$ssh_opts" "$ssh_host" "$is_root" "$ssh_password" \
+    "systemctl status '$PERIPHERY_SERVICE' -n 1000 --no-pager 2>/dev/null" \
+    | grep 'Komodo Periphery version' | tail -1 | awk '{print $NF}' || true)"
+  if [[ -z "$running_version" ]]; then
+    running_version="$(remote_priv "$ssh_opts" "$ssh_host" "$is_root" "$ssh_password" \
+      "journalctl -u '$PERIPHERY_SERVICE' -o cat -n 2000 --no-pager 2>/dev/null" \
+      | grep 'Komodo Periphery version' | tail -1 | awk '{print $NF}' || true)"
+  fi
+
+  local restart_only=0
+  if [[ $binary_ok -eq 1 ]]; then
+    if [[ -z "$running_version" ]]; then
+      echo "Already up-to-date (binary matches $latest_tag; running version unknown), skipping."
+      return 0
+    elif [[ "${running_version#v}" == "${latest_tag#v}" ]]; then
+      echo "Already up-to-date (binary matches, running $running_version), skipping."
+      return 0
+    fi
+    echo "Binary is current but service is running ${running_version}; restarting only..."
+    restart_only=1
+  else
+    echo "Binary differs from release $latest_tag (reported version: ${remote_version:-unknown}, running: ${running_version:-unknown}); updating..."
+  fi
 
   local delay="$RESTART_DELAY"
   [[ $is_self -eq 1 ]] && delay="$SELF_RESTART_DELAY"
@@ -331,14 +369,17 @@ process_host() {
       SUDO_PASSWORD="$(printf '%q' "$ssh_password")" \
       IS_ROOT="$is_root" \
       IS_SELF="$is_self" \
+      RESTART_ONLY="$restart_only" \
       DELAY="$delay" \
       'bash -s' <<'EOF'
 set -euo pipefail
-tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
-
-curl -fsSL --retry 3 --connect-timeout 15 "$URL" -o "$tmp"
-chmod +x "$tmp"
+tmp=""
+trap 'if [[ -n "$tmp" ]]; then rm -f "$tmp"; fi' EXIT
+if [[ "$RESTART_ONLY" != "1" ]]; then
+  tmp="$(mktemp)"
+  curl -fsSL --retry 3 --connect-timeout 15 "$URL" -o "$tmp"
+  chmod +x "$tmp"
+fi
 
 # Run a command with the right privileges
 run() {
@@ -351,7 +392,9 @@ run() {
   fi
 }
 
-run install -m 0755 "$tmp" "$BIN"
+if [[ "$RESTART_ONLY" != "1" ]]; then
+  run install -m 0755 "$tmp" "$BIN"
+fi
 
 if [[ "$IS_SELF" == "1" ]]; then
   # This host runs the script inside the periphery cgroup: restart through a

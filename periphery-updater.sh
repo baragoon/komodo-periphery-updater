@@ -5,6 +5,14 @@ set -euo pipefail
 # Periphery Auto-Update Script (runs on Core host OS)
 # Monitors moghtech/komodo releases, downloads periphery binaries to remote
 # Linux hosts (amd64/arm64), restarts periphery systemd service.
+#
+# NOTE: when this script is launched by Komodo (post-deploy stage) it runs
+# inside the cgroup of the periphery service on the *local* host. Restarting
+# that service kills the script. To avoid this:
+#   - the restart is issued through a transient systemd timer
+#     (systemd-run --on-active), which lives in its own cgroup
+#   - the host this script runs on (detected via boot_id) is updated LAST,
+#     and its restart is delayed so the script can finish and record state
 ##############################################################################
 
 GITHUB_OWNER="${GITHUB_OWNER:-moghtech}"
@@ -16,6 +24,10 @@ STATE_FILE="${STATE_FILE:-${HOME}/.local/komodo/periphery-updater.last_tag}"
 PERIPHERY_BIN_PATH="${PERIPHERY_BIN_PATH:-/usr/local/bin/periphery}"
 PERIPHERY_SERVICE="${PERIPHERY_SERVICE:-periphery}"
 REMOTE_SUDO="${REMOTE_SUDO:-sudo}"
+# Seconds to wait before the detached service restart fires.
+# The local host gets a longer delay so Komodo can receive the stage result.
+RESTART_DELAY="${RESTART_DELAY:-3}"
+SELF_RESTART_DELAY="${SELF_RESTART_DELAY:-8}"
 
 ##############################################################################
 # Check for required commands and auto-install if missing
@@ -154,25 +166,33 @@ echo "  aarch64: $arm64_url"
 
 all_ok=1
 updated=0
+deferred_hosts=()
+local_boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
 
-for host in $PERIPHERY_HOSTS; do
+##############################################################################
+# process_host <host-entry> <pass>
+#   pass 1: normal hosts; the host we are running on is deferred
+#   pass 2: deferred (local) host, detached delayed restart
+# Never returns non-zero; failures set all_ok=0.
+##############################################################################
+process_host() {
+  local host="$1"
+  local pass="$2"
+
   # Parse host entry: user@host[:port[:password]]
-  ssh_host="$host"
-  ssh_port=""
-  ssh_password=""  # No default password
-  
-  # Split by colon to extract port and password
+  local ssh_host="$host"
+  local ssh_port=""
+  local ssh_password=""  # No default password
+  local remainder first_part
+
   if [[ "$host" == *:* ]]; then
     ssh_host="${host%%:*}"
     remainder="${host#*:}"
-    
-    # Check if there's a second colon (password separator)
+
     if [[ "$remainder" == *:* ]]; then
       # Format: user@host:port:password or user@host::password
       first_part="${remainder%%:*}"
       ssh_password="${remainder#*:}"
-      
-      # If first part is numeric, it's a port
       if [[ "$first_part" =~ ^[0-9]+$ ]]; then
         ssh_port="$first_part"
       else
@@ -181,7 +201,6 @@ for host in $PERIPHERY_HOSTS; do
       fi
     else
       # Format: user@host:port or user@host:password
-      # Determine if it's port or password
       if [[ "$remainder" =~ ^[0-9]+$ ]]; then
         ssh_port="$remainder"
       else
@@ -189,105 +208,131 @@ for host in $PERIPHERY_HOSTS; do
       fi
     fi
   fi
-  
-  ssh_opts="-o BatchMode=yes -o ConnectTimeout=10"
+
+  local ssh_opts="-o BatchMode=yes -o ConnectTimeout=10"
   if [[ -n "$ssh_port" ]]; then
     ssh_opts="$ssh_opts -p $ssh_port"
-    if [[ -n "$ssh_password" ]]; then
-      echo "---- Host: $ssh_host (port $ssh_port, with password) ----"
-    else
-      echo "---- Host: $ssh_host (port $ssh_port) ----"
-    fi
-  else
-    if [[ -n "$ssh_password" ]]; then
-      echo "---- Host: $ssh_host (with password) ----"
-    else
-      echo "---- Host: $ssh_host ----"
-    fi
   fi
 
+  # Detect whether this host is the machine we are running on
+  local is_self=0
+  local remote_boot_id
+  remote_boot_id="$(ssh $ssh_opts "$ssh_host" 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null || true)"
+  if [[ -n "$local_boot_id" && "$remote_boot_id" == "$local_boot_id" ]]; then
+    is_self=1
+  fi
+
+  if [[ $is_self -eq 1 && "$pass" == "1" ]]; then
+    echo "---- Host: $ssh_host is the local host; deferring to the end ----"
+    deferred_hosts+=("$host")
+    return 0
+  fi
+
+  local label="$ssh_host"
+  [[ -n "$ssh_port" ]] && label="$label (port $ssh_port"
+  if [[ -n "$ssh_password" ]]; then
+    if [[ -n "$ssh_port" ]]; then label="$label, with password)"; else label="$label (with password)"; fi
+  elif [[ -n "$ssh_port" ]]; then
+    label="$label)"
+  fi
+  [[ $is_self -eq 1 ]] && label="$label [local]"
+  echo "---- Host: $label ----"
+
   # Check if user is root or has passwordless sudo
+  local remote_user_check
   remote_user_check="$(ssh $ssh_opts "$ssh_host" 'id -u' 2>/dev/null || true)"
-  is_root=0
+  local is_root=0
   if [[ "$remote_user_check" == "0" ]]; then
     is_root=1
   fi
-  
+
   # If not root, check if sudo works without password or if password is provided
-  if [[ $is_root -eq 0 ]]; then
-    if [[ -z "$ssh_password" ]]; then
-      # No password provided, require passwordless sudo
-      if ! (ssh $ssh_opts "$ssh_host" 'sudo -n true' 2>/dev/null); then
-        echo "sudo requires password; provide it in PERIPHERY_HOSTS as user@host:password or user@host:port:password"
-        all_ok=0
-        continue
-      fi
+  if [[ $is_root -eq 0 && -z "$ssh_password" ]]; then
+    if ! (ssh $ssh_opts "$ssh_host" 'sudo -n true' 2>/dev/null); then
+      echo "sudo requires password; provide it in PERIPHERY_HOSTS as user@host:password or user@host:port:password"
+      all_ok=0
+      return 0
     fi
   fi
 
+  local remote_arch
   remote_arch="$(ssh $ssh_opts "$ssh_host" 'uname -m' 2>/dev/null || true)"
 
   if [[ -z "$remote_arch" ]]; then
     echo "Could not probe host $host"
     all_ok=0
-    continue
+    return 0
   fi
 
+  local asset_url
   case "$remote_arch" in
     x86_64|amd64) asset_url="$amd64_url" ;;
     aarch64|arm64) asset_url="$arm64_url" ;;
     *)
       echo "Unsupported arch: $remote_arch"
       all_ok=0
-      continue
+      return 0
       ;;
   esac
 
   echo "Arch: $remote_arch; checking version..."
 
   # Check current version on remote host
+  local remote_version
   remote_version="$(ssh $ssh_opts "$ssh_host" "$PERIPHERY_BIN_PATH --version 2>/dev/null || true" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?' | head -1 || echo "unknown")"
-  
+
   # Normalize versions by removing 'v' prefix for comparison
-  remote_version_normalized="${remote_version#v}"
-  latest_tag_normalized="${latest_tag#v}"
-  
-  if [[ "$remote_version_normalized" == "$latest_tag_normalized" ]]; then
+  if [[ "${remote_version#v}" == "${latest_tag#v}" ]]; then
     echo "Already up-to-date ($remote_version), skipping."
-    continue
+    return 0
   fi
-  
-  echo "Version mismatch: remote=$remote_version, latest=$latest_tag; updating..."
+
+  echo "Version mismatch: remote=${remote_version:-unknown}, latest=$latest_tag; updating..."
+
+  local delay="$RESTART_DELAY"
+  [[ $is_self -eq 1 ]] && delay="$SELF_RESTART_DELAY"
 
   if ssh $ssh_opts "$ssh_host" \
-      URL="$asset_url" \
-      BIN="$PERIPHERY_BIN_PATH" \
-      SERVICE="$PERIPHERY_SERVICE" \
-      SUDO_CMD="$REMOTE_SUDO" \
-      SUDO_PASSWORD="$ssh_password" \
+      URL="$(printf '%q' "$asset_url")" \
+      BIN="$(printf '%q' "$PERIPHERY_BIN_PATH")" \
+      SERVICE="$(printf '%q' "$PERIPHERY_SERVICE")" \
+      SUDO_CMD="$(printf '%q' "$REMOTE_SUDO")" \
+      SUDO_PASSWORD="$(printf '%q' "$ssh_password")" \
       IS_ROOT="$is_root" \
+      IS_SELF="$is_self" \
+      DELAY="$delay" \
       'bash -s' <<'EOF'
 set -euo pipefail
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
-curl -fL --retry 3 --connect-timeout 15 "$URL" -o "$tmp"
+curl -fsSL --retry 3 --connect-timeout 15 "$URL" -o "$tmp"
 chmod +x "$tmp"
 
-if [[ "$IS_ROOT" == "1" ]]; then
-  install -m 0755 "$tmp" "$BIN"
-  systemctl restart "$SERVICE"
-  systemctl is-active --quiet "$SERVICE"
-else
-  if [[ -n "${SUDO_PASSWORD:-}" ]]; then
-    echo "$SUDO_PASSWORD" | $SUDO_CMD -S install -m 0755 "$tmp" "$BIN"
-    echo "$SUDO_PASSWORD" | $SUDO_CMD -S systemctl restart "$SERVICE"
-    echo "$SUDO_PASSWORD" | $SUDO_CMD -S systemctl is-active --quiet "$SERVICE"
+# Run a command with the right privileges
+run() {
+  if [[ "$IS_ROOT" == "1" ]]; then
+    "$@"
+  elif [[ -n "${SUDO_PASSWORD:-}" ]]; then
+    echo "$SUDO_PASSWORD" | $SUDO_CMD -S "$@"
   else
-    $SUDO_CMD install -m 0755 "$tmp" "$BIN"
-    $SUDO_CMD systemctl restart "$SERVICE"
-    $SUDO_CMD systemctl is-active --quiet "$SERVICE"
+    $SUDO_CMD "$@"
   fi
+}
+
+run install -m 0755 "$tmp" "$BIN"
+
+if [[ "$IS_SELF" == "1" ]]; then
+  # This host runs the script inside the periphery cgroup: restart through a
+  # transient systemd timer so it happens in its own cgroup and cannot kill
+  # this session (or the Komodo stage). It fires after the script has exited,
+  # so it can only be verified on the next run.
+  run systemd-run --quiet --collect --on-active="${DELAY}s" systemctl restart "$SERVICE"
+else
+  # Other hosts: a plain restart is safe and needs no systemd-run.
+  run systemctl restart "$SERVICE"
+  sleep 2
+  systemctl is-active --quiet "$SERVICE"
 fi
 EOF
   then
@@ -297,6 +342,17 @@ EOF
     echo "✗ Update failed on $ssh_host"
     all_ok=0
   fi
+  return 0
+}
+
+for host in $PERIPHERY_HOSTS; do
+  process_host "$host" 1
+done
+
+for host in "${deferred_hosts[@]+"${deferred_hosts[@]}"}"; do
+  # Record state before the local restart fires: it happens a few seconds
+  # after this script exits, so nothing can be written afterwards.
+  process_host "$host" 2
 done
 
 echo ""

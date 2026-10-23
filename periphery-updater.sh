@@ -164,6 +164,29 @@ echo "Assets found:"
 echo "  x86_64: $amd64_url"
 echo "  aarch64: $arm64_url"
 
+# Expected sha256 of each asset. The binary's own --version output is not
+# reliable (v2.3.4 still reports 2.3.3), so compare file hashes instead.
+# GitHub exposes the hash as .digest; fall back to hashing a download.
+sha256_stdin() {
+  if command -v sha256sum &>/dev/null; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+asset_sha() {
+  local name="$1" url="$2" sha
+  sha="$(echo "$release_json" | jq -r --arg n "$name" '.assets[] | select(.name==$n) | .digest // empty' | sed 's/^sha256://')"
+  if [[ -z "$sha" ]]; then
+    sha="$(curl -fsSL "$url" | sha256_stdin || true)"
+  fi
+  echo "$sha"
+}
+
+amd64_sha="$(asset_sha periphery-x86_64 "$amd64_url")"
+arm64_sha="$(asset_sha periphery-aarch64 "$arm64_url")"
+
 all_ok=1
 updated=0
 deferred_hosts=()
@@ -264,10 +287,10 @@ process_host() {
     return 0
   fi
 
-  local asset_url
+  local asset_url expected_sha
   case "$remote_arch" in
-    x86_64|amd64) asset_url="$amd64_url" ;;
-    aarch64|arm64) asset_url="$arm64_url" ;;
+    x86_64|amd64) asset_url="$amd64_url"; expected_sha="$amd64_sha" ;;
+    aarch64|arm64) asset_url="$arm64_url"; expected_sha="$arm64_sha" ;;
     *)
       echo "Unsupported arch: $remote_arch"
       all_ok=0
@@ -281,13 +304,21 @@ process_host() {
   local remote_version
   remote_version="$(ssh $ssh_opts "$ssh_host" "$PERIPHERY_BIN_PATH --version 2>/dev/null || true" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?' | head -1 || echo "unknown")"
 
-  # Normalize versions by removing 'v' prefix for comparison
-  if [[ "${remote_version#v}" == "${latest_tag#v}" ]]; then
+  # Compare the installed binary's sha256 with the release asset (reliable).
+  # Fall back to the --version string only if no hash is available.
+  local remote_sha=""
+  if [[ -n "$expected_sha" ]]; then
+    remote_sha="$(ssh $ssh_opts "$ssh_host" "sha256sum '$PERIPHERY_BIN_PATH' 2>/dev/null || shasum -a 256 '$PERIPHERY_BIN_PATH' 2>/dev/null" | awk '{print $1}' || true)"
+    if [[ "$remote_sha" == "$expected_sha" ]]; then
+      echo "Already up-to-date (sha256 matches release $latest_tag), skipping."
+      return 0
+    fi
+  elif [[ "${remote_version#v}" == "${latest_tag#v}" ]]; then
     echo "Already up-to-date ($remote_version), skipping."
     return 0
   fi
 
-  echo "Version mismatch: remote=${remote_version:-unknown}, latest=$latest_tag; updating..."
+  echo "Binary differs from release $latest_tag (reported version: ${remote_version:-unknown}); updating..."
 
   local delay="$RESTART_DELAY"
   [[ $is_self -eq 1 ]] && delay="$SELF_RESTART_DELAY"
